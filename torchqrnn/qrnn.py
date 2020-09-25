@@ -5,6 +5,43 @@ from torch.autograd import Variable
 from .forget_mult import ForgetMult
 
 
+class BiQRNNLayer(nn.Module):
+    def __init__(self, input_size, hidden_size=None, save_prev_x=False, zoneout=0, window=1, output_gate=True,
+                 use_cuda=True):
+        super(BiQRNNLayer, self).__init__()
+
+        assert window in [1,
+                          2], "This QRNN implementation currently only handles convolutional window of size 1 or size 2"
+        self.window = window
+        self.input_size = input_size
+        self.hidden_size = hidden_size if hidden_size else input_size
+        self.zoneout = zoneout
+        self.save_prev_x = save_prev_x
+        self.prevX = None
+        self.output_gate = output_gate
+        self.use_cuda = use_cuda
+
+        self.forward_qrnn = QRNNLayer(input_size, hidden_size=hidden_size, save_prev_x=save_prev_x, zoneout=zoneout,
+                                      window=window,
+                                      output_gate=output_gate, use_cuda=use_cuda)
+        self.backward_qrnn = QRNNLayer(input_size, hidden_size=hidden_size, save_prev_x=save_prev_x, zoneout=zoneout,
+                                       window=window,
+                                       output_gate=output_gate, use_cuda=use_cuda)
+
+    def forward(self, X, hidden=None):
+        fwd, h_fwd = self.forward_qrnn(X, hidden=hidden)
+        bwd, h_bwd = self.backward_qrnn(torch.flip(X, [0]), hidden=hidden)
+        return torch.flip(torch.cat([fwd, bwd], dim=-1), [0]), torch.cat([h_fwd, h_bwd], dim=-1)
+
+
+def fast_tanh(x):
+    return x / (1 + x.abs())
+
+
+def fast_sigmoid(x):
+    return (x / 2) / (1 + x.abs()) + 0.5
+
+
 class QRNNLayer(nn.Module):
     r"""Applies a single layer Quasi-Recurrent Neural Network (QRNN) to an input sequence.
 
@@ -26,10 +63,12 @@ class QRNNLayer(nn.Module):
         - h_n (batch, hidden_size): tensor containing the hidden state for t=seq_len
     """
 
-    def __init__(self, input_size, hidden_size=None, save_prev_x=False, zoneout=0, window=1, output_gate=True, use_cuda=True):
+    def __init__(self, input_size, hidden_size=None, save_prev_x=False, zoneout=0, window=1, output_gate=True,
+                 use_cuda=True):
         super(QRNNLayer, self).__init__()
 
-        assert window in [1, 2], "This QRNN implementation currently only handles convolutional window of size 1 or size 2"
+        assert window in [1,
+                          2], "This QRNN implementation currently only handles convolutional window of size 1 or size 2"
         self.window = window
         self.input_size = input_size
         self.hidden_size = hidden_size if hidden_size else input_size
@@ -40,7 +79,8 @@ class QRNNLayer(nn.Module):
         self.use_cuda = use_cuda
 
         # One large matmul with concat is faster than N small matmuls and no concat
-        self.linear = nn.Linear(self.window * self.input_size, 3 * self.hidden_size if self.output_gate else 2 * self.hidden_size)
+        self.linear = nn.Linear(self.window * self.input_size,
+                                3 * self.hidden_size if self.output_gate else 2 * self.hidden_size)
 
     def reset(self):
         # If you are saving the previous value of x, you should call this when starting with a new state
@@ -69,13 +109,12 @@ class QRNNLayer(nn.Module):
         if self.output_gate:
             Y = Y.view(seq_len, batch_size, 3 * self.hidden_size)
             Z, F, O = Y.chunk(3, dim=2)
-            O = torch.sigmoid(O)
         else:
             Y = Y.view(seq_len, batch_size, 2 * self.hidden_size)
             Z, F = Y.chunk(2, dim=2)
         ###
-        Z = torch.tanh(Z)
-        F = torch.sigmoid(F)
+        Z = fast_tanh(Z)  # torch.nn.functional.tanh(Z)
+        F = fast_sigmoid(F)  # torch.nn.functional.sigmoid(F)
 
         # If zoneout is specified, we perform dropout on the forget gates in F
         # If an element of F is zero, that means the corresponding neuron keeps the old value
@@ -98,7 +137,7 @@ class QRNNLayer(nn.Module):
 
         # Apply (potentially optional) output gate
         if self.output_gate:
-            H = torch.sigmoid(O) * C
+            H = fast_sigmoid(O) * C  # torch.nn.functional.sigmoid(O) * C
         else:
             H = C
 
@@ -135,13 +174,21 @@ class QRNN(torch.nn.Module):
     def __init__(self, input_size, hidden_size,
                  num_layers=1, bias=True, batch_first=False,
                  dropout=0, bidirectional=False, layers=None, **kwargs):
-        assert bidirectional == False, 'Bidirectional QRNN is not yet supported'
+        # assert bidirectional == False, 'Bidirectional QRNN is not yet supported'
         assert batch_first == False, 'Batch first mode is not yet supported'
         assert bias == True, 'Removing underlying bias is not yet supported'
 
         super(QRNN, self).__init__()
 
-        self.layers = torch.nn.ModuleList(layers if layers else [QRNNLayer(input_size if l == 0 else hidden_size, hidden_size, **kwargs) for l in range(num_layers)])
+        if bidirectional:
+            self.layers = torch.nn.ModuleList(
+                layers if layers else [BiQRNNLayer(input_size if l == 0 else hidden_size * 2, hidden_size, **kwargs)
+                                       for l in
+                                       range(num_layers)])
+        else:
+            self.layers = torch.nn.ModuleList(
+                layers if layers else [QRNNLayer(input_size if l == 0 else hidden_size, hidden_size, **kwargs) for l in
+                                       range(num_layers)])
 
         self.input_size = input_size
         self.hidden_size = hidden_size
@@ -171,17 +218,37 @@ class QRNN(torch.nn.Module):
 
 
 if __name__ == '__main__':
+    seq_len, batch_size, hidden_size, input_size = 7, 20, 256, 32
+    size = (seq_len, batch_size, input_size)
+    X = torch.autograd.Variable(torch.rand(size), requires_grad=True)#.cuda()
+    qrnn = QRNN(input_size, hidden_size, num_layers=2, dropout=0.4, use_cuda=False)
+    # qrnn.cuda()
+    output, hidden = qrnn(X)
+    assert list(output.size()) == [7, 20, 256]
+    assert list(hidden.size()) == [2, 20, 256]
+
+    ###
+
     seq_len, batch_size, hidden_size = 2, 2, 16
+    seq_len, batch_size, hidden_size = 35, 8, 32
     size = (seq_len, batch_size, hidden_size)
-    X = Variable(torch.rand(size), requires_grad=True) #.cuda()
+    X = Variable(torch.rand(size), requires_grad=True)#.cuda()
     print(X.size())
 
-    qrnn = QRNNLayer(hidden_size, hidden_size, use_cuda=False)
-    Y, hidden = qrnn(X)
-    print(Y.size())
+    qrnn = QRNNLayer(hidden_size, hidden_size)
+    # qrnn.cuda()
+    Y, _ = qrnn(X)
+
+    qrnn.use_cuda = False
+    Z, _ = qrnn(X)
+
+    diff = (Y - Z).sum().data.item()
+    print('Total difference between QRNN(use_cuda=True) and QRNN(use_cuda=False) results:', diff)
+    assert diff < 1e-5, 'CUDA and non-CUDA QRNN layers return different results'
 
     from torch.autograd import gradcheck
     inputs = [X,]
+    print('check gradient')
     # Had to loosen gradient checking, potentially due to general floating point badness?
-    test = gradcheck(QRNNLayer(hidden_size, hidden_size), inputs, eps=1e-4, atol=1e-2)
+    test = gradcheck(QRNNLayer(hidden_size, hidden_size, use_cuda=False), inputs, eps=1e-4, atol=1e-2)
     print(test)

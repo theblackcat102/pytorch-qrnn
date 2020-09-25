@@ -75,8 +75,9 @@ __global__ void bwd_recurrent_forget_mult(const float *h, const float *f, const 
 ###
 
 class CPUForgetMult(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, backwards=False):
         super(CPUForgetMult, self).__init__()
+        self.backwards = backwards
 
     def forward(self, f, x, hidden_init=None):
         result = []
@@ -92,54 +93,66 @@ class CPUForgetMult(torch.nn.Module):
             result.append(h)
             prev_h = h
         ###
+        if self.backwards: result.reverse()
         return torch.stack(result)
 
 
 class GPUForgetMult(torch.autograd.Function):
-    forget_mult = None
-    bwd_forget_mult = None
-    stream = None
+    configured_gpus = {}
+    ptx = None
     def __init__(self):
         super(GPUForgetMult, self).__init__()
-        if not self.forget_mult or not self.bwd_forget_mult:
-            GPUForgetMult.compile()
 
-    @staticmethod
-    def compile():
-        program = Program(kernel.encode(), 'recurrent_forget_mult.cu'.encode())
-        ptx = program.compile()
-        
-        m = function.Module()
-        m.load(bytes(ptx.encode()))
-        
-        GPUForgetMult.forget_mult = m.get_function('recurrent_forget_mult')
-        GPUForgetMult.bwd_forget_mult = m.get_function('bwd_recurrent_forget_mult')
 
-        Stream = namedtuple('Stream', ['ptr'])
-        GPUForgetMult.stream = Stream(ptr=torch.cuda.current_stream().cuda_stream)
+    def compile(self):
+        if self.ptx is None:
+            program = Program(kernel.encode(), 'recurrent_forget_mult.cu'.encode())
+            GPUForgetMult.ptx = program.compile()
+
+        if torch.cuda.current_device() not in GPUForgetMult.configured_gpus:
+            m = function.Module()
+            m.load(bytes(self.ptx.encode()))
+
+            self.forget_mult = m.get_function('recurrent_forget_mult')
+            self.bwd_forget_mult = m.get_function('bwd_recurrent_forget_mult')
+
+            Stream = namedtuple('Stream', ['ptr'])
+            self.stream = Stream(ptr=torch.cuda.current_stream().cuda_stream)
+
+            GPUForgetMult.configured_gpus[torch.cuda.current_device()] = (self.forget_mult, self.bwd_forget_mult, self.stream)
+
+        self.forget_mult, self.bwd_forget_mult, self.stream = GPUForgetMult.configured_gpus[torch.cuda.current_device()]
 
     def forward(self, f, x, hidden_init=None):
+        self.compile()
         seq_size, batch_size, hidden_size = f.size()
-        result = f.new(seq_size + 1, batch_size, hidden_size).zero_()
+        result = f.new(seq_size + 1, batch_size, hidden_size)
+        # We only zero the result array (result[0]) if we don't set a hidden initial state
+        # All other values (result[1:]) are overwritten by default
         if hidden_init is not None: result[0, :, :] = hidden_init
+        else: result = result.zero_()
         ###
-        grid = (math.ceil(hidden_size / 256), math.ceil(batch_size / 4))
-        self.forget_mult(grid=grid, block=(256, 4), args=[result.data_ptr(), f.data_ptr(), x.data_ptr(), seq_size, batch_size, hidden_size], stream=self.stream)
+        grid_hidden_size = min(hidden_size, 512)
+        grid = (math.ceil(hidden_size / grid_hidden_size), batch_size)
+        self.forget_mult(grid=grid, block=(grid_hidden_size, 1), args=[result.data_ptr(), f.data_ptr(), x.data_ptr(), seq_size, batch_size, hidden_size], stream=self.stream)
         self.save_for_backward(f, x, hidden_init)
         self.result = result
         return result[1:, :, :]
 
     def backward(self, grad_h):
+        self.compile()
         f, x, hidden_init = self.saved_tensors
         h = self.result
         ###
         seq_size, batch_size, hidden_size = f.size()
-        grad_f = f.new(*f.size()).zero_()
-        grad_x = f.new(*f.size()).zero_()
-        grad_h_init = f.new(batch_size, hidden_size).zero_()
+        # Zeroing is not necessary as these will be overwritten
+        grad_f = f.new(*f.size())
+        grad_x = f.new(*f.size())
+        grad_h_init = f.new(batch_size, hidden_size)
         ###
-        grid = (math.ceil(hidden_size / 256), math.ceil(batch_size / 4))
-        self.bwd_forget_mult(grid=grid, block=(256, 4), args=[h.data_ptr(), f.data_ptr(), x.data_ptr(), grad_h.data_ptr(), grad_f.data_ptr(), grad_x.data_ptr(), grad_h_init.data_ptr(), seq_size, batch_size, hidden_size], stream=self.stream)
+        grid_hidden_size = min(hidden_size, 512)
+        grid = (math.ceil(hidden_size / grid_hidden_size), batch_size)
+        self.bwd_forget_mult(grid=grid, block=(grid_hidden_size, 1), args=[h.data_ptr(), f.data_ptr(), x.data_ptr(), grad_h.data_ptr(), grad_f.data_ptr(), grad_x.data_ptr(), grad_h_init.data_ptr(), seq_size, batch_size, hidden_size], stream=self.stream)
         ###
         if hidden_init is not None:
             return grad_f, grad_x, grad_h_init
@@ -192,6 +205,7 @@ if __name__ == '__main__':
     print('=-=-' * 5)
 
     resulta = ForgetMult()(forget, a, last_h, use_cuda=True)
+    print(resulta.size())
     loss = resulta.pow(2).sum()
     loss.backward()
 
