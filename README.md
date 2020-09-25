@@ -1,7 +1,5 @@
 # Quasi-Recurrent Neural Network (QRNN) for PyTorch
 
-Updated to support multi-GPU environments via `DataParallel` - see the the `multigpu_dataparallel.py` example.
-
 This repository contains a PyTorch implementation of [Salesforce Research](https://einstein.ai/)'s [Quasi-Recurrent Neural Networks](https://arxiv.org/abs/1611.01576) paper.
 
 The QRNN provides similar accuracy to the LSTM but can be betwen 2 and 17 times faster than the highly optimized NVIDIA cuDNN LSTM implementation depending on the use case.
@@ -26,12 +24,6 @@ If you use this code or our results in your research, please cite:
 This codebase requires Python 3, [PyTorch](http://pytorch.org/), [pynvrtc](https://github.com/NVIDIA/pynvrtc) (NVIDIA's Python Bindings to NVRTC), and [CuPy](https://cupy.chainer.org/).
 While the codebase contains a CPU implementation of the QRNN, the GPU QRNN implementation is used by default if possible.
 Requirements are provided in `requirements.txt`.
-
-## Example Usage
-
-We've updated the previously released Salesforce Research [AWD-LSTM language modeling](https://github.com/salesforce/awd-lstm-lm) codebase to support use of the `AWD-QRNN`.
-With the same number of parameters as the LSTM and less well tuned hyper parameters, the QRNN model trains over twice as quickly and achieves nearly equivalent state-of-the-art language modeling results.
-For full details, refer to the [AWD-LSTM-LM repository](https://github.com/salesforce/awd-lstm-lm).
 
 ## Usage
 
@@ -130,5 +122,6 @@ Open tasks that are interesting:
 
 + Modify the `ForgetMult` CUDA kernel to produce a `BackwardForgetMult`. This will enable a bidirectional QRNN. The input should be the same - `f` and `x` - but the kernel should walk backwards through the inputs.
 + Bidirectional QRNN support (requires the modification above)
++ Enable the QRNN layers to work in multi-GPU environments
 + Support PyTorch's `PackedSequence` such that variable length sequences are correctly masked
 + Show how to use the underlying fast recurrence operator `ForgetMult` in other generic ways
